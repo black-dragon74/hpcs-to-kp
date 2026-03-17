@@ -3,7 +3,7 @@ set -euo pipefail
 
 # --- Configuration ---
 NS=${NS:-openshift-storage}
-STORAGE_CLASS=${STORAGE_CLASS:-}
+STORAGE_CLASS=${STORAGE_CLASS:-ocs-storagecluster-ceph-rbd-encrypted}
 SUBVOLUME_GROUP=${SUBVOLUME_GROUP:-csi}
 DATA_FILE=${DATA_FILE:-rbd_volumes.json}
 TOOLBOX_LABEL="app=rook-ceph-tools"
@@ -477,7 +477,7 @@ Environment variables (auto sourced if a .env file exists):
   DATA_FILE           JSON output file (default: rbd_volumes.json)
 
   NS                  Namespace (default: openshift-storage)
-  STORAGE_CLASS       Kubernetes StorageClass name (required)
+  STORAGE_CLASS       Kubernetes StorageClass name (default: ocs-storagecluster-ceph-rbd-encrypted)
                       Pool, pool ID, cluster ID, and volume name prefix are derived automatically.
 
   HPCS_INSTANCE_ID    HPCS instance ID
