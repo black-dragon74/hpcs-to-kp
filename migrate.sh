@@ -3,12 +3,16 @@ set -euo pipefail
 
 # --- Configuration ---
 NS=${NS:-openshift-storage}
-POOL=${POOL:-ocs-storagecluster-cephblockpool}
+STORAGE_CLASS=${STORAGE_CLASS:-}
 SUBVOLUME_GROUP=${SUBVOLUME_GROUP:-csi}
 DATA_FILE=${DATA_FILE:-rbd_volumes.json}
 TOOLBOX_LABEL="app=rook-ceph-tools"
-CLUSTER_ID=${CLUSTER_ID:-openshift-storage}
-POOL_ID=${POOL_ID:-}
+
+# Derived from StorageClass and Ceph (set by resolve_params)
+POOL=""
+POOL_ID=""
+CLUSTER_ID=""
+VOLUME_NAME_PREFIX=""
 
 # HPCS configuration
 HPCS_INSTANCE_ID=${HPCS_INSTANCE_ID:-}
@@ -88,33 +92,62 @@ get_iam_token() {
         jq -r '.access_token'
 }
 
-# Ported from ComposeCSIID() in go
-csi_volid() {
-    local image_name="$1"
-    local cluster_id="$2"
-    local pool_id="$3"
-
-    if [ -z "$image_name" ] || [ -z "$cluster_id" ] || [ -z "$pool_id" ]; then
-        log_error "Usage: csi_volid <image_name> <cluster_id> <pool_id>"
-        return 1
+resolve_storage_class_params() {
+    if [[ -z "${STORAGE_CLASS}" ]]; then
+        log_fatal "STORAGE_CLASS must be set"
     fi
 
-    # UUID is 36 chars
-    local uuid="${image_name: -36}"
+    local sc_json
+    sc_json=$($(kube_cmd) get storageclass "${STORAGE_CLASS}" -o json 2>/dev/null) ||
+        log_fatal "StorageClass '${STORAGE_CLASS}' not found"
 
-    # Ported from validate volume ID
+    POOL=$(echo "${sc_json}" | jq -r '.parameters.pool // empty')
+    CLUSTER_ID=$(echo "${sc_json}" | jq -r '.parameters.clusterID // empty')
+    VOLUME_NAME_PREFIX=$(echo "${sc_json}" | jq -r '.parameters.volumeNamePrefix // "csi-vol-"')
+
+    if [[ -z "${POOL}" ]]; then
+        log_fatal "StorageClass '${STORAGE_CLASS}' has no parameters.pool"
+    fi
+    if [[ -z "${CLUSTER_ID}" ]]; then
+        log_fatal "StorageClass '${STORAGE_CLASS}' has no parameters.clusterID"
+    fi
+
+    log_info "Derived from StorageClass: pool=${POOL}, clusterID=${CLUSTER_ID}, volumeNamePrefix=${VOLUME_NAME_PREFIX}"
+}
+
+resolve_pool_id() {
+    local pool_detail
+    pool_detail=$(exec_in_toolbox "ceph osd pool ls detail --format json")
+
+    POOL_ID=$(echo "${pool_detail}" | jq -r --arg pool "${POOL}" '.[] | select(.pool_name == $pool) | .pool_id')
+
+    if [[ -z "${POOL_ID}" ]]; then
+        log_fatal "Could not find pool ID for pool '${POOL}'"
+    fi
+
+    log_info "Derived pool ID: ${POOL_ID}"
+}
+
+resolve_params() {
+    resolve_storage_class_params
+    resolve_pool_id
+}
+
+image_name_from_volume_handle() {
+    local volume_handle="$1"
+    local uuid="${volume_handle: -36}"
+
     if ! echo "$uuid" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-        log_error "Could not extract a valid UUID from image name '${image_name}'"
+        log_error "Could not extract a valid UUID from volumeHandle '${volume_handle}'"
         return 1
     fi
 
-    local version="0001"
-    local cid_len
-    cid_len=$(printf '%04x' ${#cluster_id})
-    local pool_hex
-    pool_hex=$(printf '%016x' "$pool_id")
+    echo "${VOLUME_NAME_PREFIX}${uuid}"
+}
 
-    echo "${version}-${cid_len}-${cluster_id}-${pool_hex}-${uuid}"
+list_pvs_for_storage_class() {
+    $(kube_cmd) get pv -o json | jq -r --arg sc "${STORAGE_CLASS}" \
+        '.items[] | select(.spec.storageClassName == $sc) | select(.spec.csi.volumeHandle != null) | .spec.csi.volumeHandle'
 }
 
 # --- Prereqs ---
@@ -142,6 +175,16 @@ check_prereqs() {
         missing=1
     fi
 
+    if [[ -z "${STORAGE_CLASS}" ]]; then
+        log_error "STORAGE_CLASS must be set"
+        missing=1
+    elif ! $(kube_cmd) get storageclass "${STORAGE_CLASS}" &>/dev/null; then
+        log_error "StorageClass '${STORAGE_CLASS}' not found in cluster"
+        missing=1
+    else
+        log_info "Found StorageClass: ${STORAGE_CLASS}"
+    fi
+
     local pod
     pod=$(get_toolbox_pod)
     if [[ -z "$pod" ]]; then
@@ -166,22 +209,28 @@ require_data_file() {
 # --- Phase 1: Discover encrypted RBD volumes and collect DEKs ---
 
 phase1_discover() {
-    log_info "Phase 1: Discovering encrypted RBD volumes"
+    log_info "Phase 1: Discovering encrypted RBD volumes from StorageClass ${STORAGE_CLASS}"
 
-    local images
-    images=$(exec_in_toolbox "rbd ls ${POOL} --format json")
-    log_debug "Raw image list: ${images}"
+    resolve_params
 
-    local image_list
-    image_list=$(echo "${images}" | jq -r '.[]')
+    local volume_handles
+    volume_handles=$(list_pvs_for_storage_class)
+    log_debug "PV volumeHandles: ${volume_handles}"
 
     echo "{}" >"${DATA_FILE}"
 
     local count=0 encrypted_count=0
 
-    while IFS= read -r image; do
-        [[ -z "$image" ]] && continue
+    while IFS= read -r vol_handle; do
+        [[ -z "$vol_handle" ]] && continue
         count=$((count + 1))
+
+        local image
+        image=$(image_name_from_volume_handle "${vol_handle}")
+        if [[ -z "$image" ]]; then
+            log_warn "Skipping volumeHandle ${vol_handle}: could not extract image name"
+            continue
+        fi
 
         local metadata
         metadata=$(exec_in_toolbox "rbd image-meta list ${POOL}/${image} --format json" 2>/dev/null || echo "{}")
@@ -196,16 +245,17 @@ phase1_discover() {
             dek=$(echo "${metadata}" | jq -r '."rbd.csi.ceph.com/dek" // ""')
 
             jq --arg id "${image}" --arg enc "${is_encrypted}" --arg dek "${dek}" \
-                '.[$id] = {encrypted: $enc, dek: $dek}' \
+                --arg vh "${vol_handle}" --arg pool "${POOL}" \
+                '.[$id] = {encrypted: $enc, dek: $dek, volumeHandle: $vh, pool: $pool}' \
                 "${DATA_FILE}" >"${DATA_FILE}.tmp" && mv "${DATA_FILE}.tmp" "${DATA_FILE}"
 
             log_info "Encrypted volume found: ${image}"
         else
-            log_debug "Skipping unencrypted volume: ${image}"
+            log_debug "Skipping unencrypted volume: ${image}, state: ${is_encrypted}"
         fi
-    done <<<"${image_list}"
+    done <<<"${volume_handles}"
 
-    log_info "Phase 1 complete: ${encrypted_count} encrypted out of ${count} total. Data saved to ${DATA_FILE}"
+    log_info "Phase 1 complete: ${encrypted_count} encrypted out of ${count} total. Data saved to ${DATA_FILE}, you may run phase 2 now"
 }
 
 # --- Phase 2: Decrypt DEKs using HPCS Unwrap ---
@@ -217,10 +267,6 @@ phase2_unwrap_hpcs() {
 
     if [[ -z "${HPCS_IAM_API_KEY}" || -z "${HPCS_INSTANCE_ID}" || -z "${HPCS_URL}" || -z "${HPCS_KEY_ID}" ]]; then
         log_fatal "HPCS_IAM_API_KEY, HPCS_INSTANCE_ID, HPCS_URL, and HPCS_KEY_ID must be set"
-    fi
-
-    if [[ -z "${POOL_ID}" ]]; then
-        log_fatal "POOL_ID must be set. Run 'ceph osd pool ls detail' in the toolbox to find it."
     fi
 
     log_debug "Fetching IAM token for HPCS"
@@ -255,9 +301,13 @@ phase2_unwrap_hpcs() {
             continue
         fi
 
-        # Construct full CSI volume ID for AAD
+        # volumeHandle from PV is the CSI volume ID, used as AAD
         local csi_vol
-        csi_vol=$(csi_volid "${vol_id}" "${CLUSTER_ID}" "${POOL_ID}")
+        csi_vol=$(jq -r --arg id "${vol_id}" '.[$id].volumeHandle // empty' "${DATA_FILE}")
+        if [[ -z "${csi_vol}" ]]; then
+            log_error "No volumeHandle for ${vol_id} in data file. Re-run phase1."
+            continue
+        fi
         log_debug "CSI volume ID: ${csi_vol}"
 
         log_info "Unwrapping DEK for ${vol_id}"
@@ -299,10 +349,6 @@ phase3_wrap_kp() {
         log_fatal "KP_IAM_API_KEY, KP_INSTANCE_ID, KP_URL, and KP_KEY_ID must be set"
     fi
 
-    if [[ -z "${POOL_ID}" ]]; then
-        log_fatal "POOL_ID must be set. Run 'ceph osd pool ls detail' in the toolbox to find it."
-    fi
-
     log_debug "Fetching IAM token for KP"
     local token
     token=$(get_iam_token "${KP_IAM_API_KEY}")
@@ -321,9 +367,13 @@ phase3_wrap_kp() {
             continue
         fi
 
-        # Construct full CSI volume ID for AAD
+        # volumeHandle from PV is the CSI volume ID, used as AAD
         local csi_vol
-        csi_vol=$(csi_volid "${vol_id}" "${CLUSTER_ID}" "${POOL_ID}")
+        csi_vol=$(jq -r --arg id "${vol_id}" '.[$id].volumeHandle // empty' "${DATA_FILE}")
+        if [[ -z "${csi_vol}" ]]; then
+            log_error "No volumeHandle for ${vol_id} in data file. Re-run phase1."
+            continue
+        fi
 
         log_info "Wrapping DEK for ${vol_id}"
 
@@ -392,8 +442,15 @@ phase4_update_metadata() {
             continue
         fi
 
+        local vol_pool
+        vol_pool=$(jq -r --arg id "${vol_id}" '.[$id].pool // empty' "${DATA_FILE}")
+        if [[ -z "${vol_pool}" ]]; then
+            log_error "No pool for ${vol_id} in data file. Re-run phase1."
+            continue
+        fi
+
         log_info "Updating metadata for ${vol_id}"
-        exec_in_toolbox "rbd image-meta set ${POOL}/${vol_id} rbd.csi.ceph.com/dek '${kp_encrypted}'"
+        exec_in_toolbox "rbd image-meta set ${vol_pool}/${vol_id} rbd.csi.ceph.com/dek '${kp_encrypted}'"
         log_debug "Metadata updated for ${vol_id}"
     done <<<"${volume_ids}"
 
@@ -418,12 +475,11 @@ Commands:
 Environment variables (auto sourced if a .env file exists):
   LOG_LEVEL           Log level: DEBUG, INFO, WARN, ERROR, FATAL (default: INFO)
   DATA_FILE           JSON output file (default: rbd_volumes.json)
-  
+
   NS                  Namespace (default: openshift-storage)
-  POOL                Ceph blockpool (default: ocs-storagecluster-cephblockpool)
-  CLUSTER_ID          Ceph CSI cluster ID (default: openshift-storage)
-  POOL_ID             Numeric Ceph blockpool ID for POOL (run 'ceph osd pool ls detail' to find it)
-  
+  STORAGE_CLASS       Kubernetes StorageClass name (required)
+                      Pool, pool ID, cluster ID, and volume name prefix are derived automatically.
+
   HPCS_INSTANCE_ID    HPCS instance ID
   HPCS_IAM_API_KEY    HPCS IAM API key
   HPCS_KEY_ID         HPCS root key ID
