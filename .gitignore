@@ -1,4 +1,12 @@
+# -_-
 .DS_Store
 
+# CSI
 rbd_volumes.json
+
+# OSD
+osd_keys.json
+exported_keys/
+
+# Sekuritiii
 .env
