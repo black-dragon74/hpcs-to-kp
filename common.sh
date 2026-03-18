@@ -2,6 +2,11 @@
 # common.sh — shared helpers for migration scripts.
 # Source this file; do not execute directly.
 
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "Error: common.sh must be sourced, not executed directly." >&2
+    exit 1
+fi
+
 # --- Logging ---
 LOG_LEVEL=${LOG_LEVEL:-INFO}
 
