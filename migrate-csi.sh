@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/common.sh"
 # --- Configuration ---
 NS=${NS:-openshift-storage}
 STORAGE_CLASS=${STORAGE_CLASS:-ocs-storagecluster-ceph-rbd-encrypted}
+CSI_KMS_CONFIGMAP=${CSI_KMS_CONFIGMAP:-csi-kms-connection-details}
 SUBVOLUME_GROUP=${SUBVOLUME_GROUP:-csi}
 DATA_FILE=${DATA_FILE:-rbd_volumes.json}
 TOOLBOX_LABEL="app=rook-ceph-tools"
@@ -370,12 +371,126 @@ phase4_update_metadata() {
   log_info "Phase 4 complete. RBD metadata updated."
 }
 
+# --- Phase 6: Update CSI KMS ConfigMap to use KP ---
+
+phase6_update_kms_config() {
+  log_info "Phase 6: Updating CSI KMS ConfigMap to use Key Protect"
+
+  # Get encryptionKMSID from StorageClass
+  local sc_json
+  sc_json=$($(kube_cmd) get storageclass "${STORAGE_CLASS}" -o json 2>/dev/null) ||
+    log_fatal "StorageClass '${STORAGE_CLASS}' not found"
+
+  local kms_id
+  kms_id=$(echo "${sc_json}" | jq -r '.parameters.encryptionKMSID // empty')
+  if [[ -z "${kms_id}" ]]; then
+    log_fatal "StorageClass '${STORAGE_CLASS}' has no parameters.encryptionKMSID"
+  fi
+  log_info "Found encryptionKMSID: ${kms_id}"
+
+  # Read the CSI KMS ConfigMap
+  local cm_json
+  cm_json=$($(kube_cmd) -n "${NS}" get configmap "${CSI_KMS_CONFIGMAP}" -o json 2>/dev/null) ||
+    log_fatal "ConfigMap '${CSI_KMS_CONFIGMAP}' not found in namespace '${NS}'"
+
+  # Check that the key exists in the ConfigMap
+  local existing_entry
+  existing_entry=$(echo "${cm_json}" | jq -r --arg key "${kms_id}" '.data[$key] // empty')
+  if [[ -z "${existing_entry}" ]]; then
+    log_fatal "Key '${kms_id}' not found in ConfigMap '${CSI_KMS_CONFIGMAP}'"
+  fi
+  log_info "Existing KMS entry for '${kms_id}':"
+  echo "${existing_entry}" | jq .
+
+  # Ask for KP secret name
+  read -rp "Enter the KP secret name to use (e.g. ibm-kp-secret): " kp_secret_name
+  if [[ -z "${kp_secret_name}" ]]; then
+    log_fatal "KP secret name cannot be empty"
+  fi
+
+  # Validate KP env vars
+  if [[ -z "${KP_INSTANCE_ID}" || -z "${KP_IAM_API_KEY}" || -z "${KP_KEY_ID}" || -z "${KP_URL}" ]]; then
+    log_fatal "KP_INSTANCE_ID, KP_IAM_API_KEY, KP_KEY_ID, and KP_URL must be set"
+  fi
+
+  # Build the new KMS entry for KP
+  local new_kms_entry
+  new_kms_entry=$(jq -n \
+    --arg provider "ibmkeyprotect" \
+    --arg svc_name "${kms_id}" \
+    --arg instance_id "${KP_INSTANCE_ID}" \
+    --arg secret_name "${kp_secret_name}" \
+    --arg base_url "${KP_URL}" \
+    --arg token_url "https://iam.cloud.ibm.com/identity/token" \
+    '{
+      KMS_PROVIDER: $provider,
+      KMS_SERVICE_NAME: $svc_name,
+      IBM_KP_SERVICE_INSTANCE_ID: $instance_id,
+      IBM_KP_SECRET_NAME: $secret_name,
+      IBM_KP_BASE_URL: $base_url,
+      IBM_KP_TOKEN_URL: $token_url
+    }')
+
+  # Build the KP secret data
+  local encoded_api_key
+  encoded_api_key=$(echo -n "${KP_IAM_API_KEY}" | base64)
+  local encoded_root_key
+  encoded_root_key=$(echo -n "${KP_KEY_ID}" | base64)
+
+  # Show summary
+  echo ""
+  log_warn "=== Phase 6 Summary ==="
+  echo ""
+  echo "ConfigMap: ${CSI_KMS_CONFIGMAP} (namespace: ${NS})"
+  echo ""
+  echo "1. Create Secret '${kp_secret_name}' in namespace '${NS}' with:"
+  echo "   - IBM_KP_SERVICE_API_KEY: (from KP_IAM_API_KEY)"
+  echo "   - IBM_KP_CUSTOMER_ROOT_KEY: (from KP_KEY_ID)"
+  echo ""
+  echo "2. Rename ConfigMap key '${kms_id}' -> '${kms_id}-orig'"
+  echo ""
+  echo "3. Create new ConfigMap key '${kms_id}' with KP config:"
+  echo "${new_kms_entry}" | jq .
+  echo ""
+
+  read -rp "Proceed? (yes/no): " confirm
+  if [[ "${confirm}" != "yes" ]]; then
+    log_info "Phase 6 aborted by user."
+    return 1
+  fi
+
+  # Step 1: Create the KP secret
+  log_info "Creating secret '${kp_secret_name}' in namespace '${NS}'"
+  $(kube_cmd) -n "${NS}" create secret generic "${kp_secret_name}" \
+    --from-literal="IBM_KP_SERVICE_API_KEY=${KP_IAM_API_KEY}" \
+    --from-literal="IBM_KP_CUSTOMER_ROOT_KEY=${KP_KEY_ID}" \
+    --dry-run=client -o yaml | $(kube_cmd) apply -f -
+
+  # Step 2: Rename existing key to -orig
+  log_info "Renaming ConfigMap key '${kms_id}' to '${kms_id}-orig'"
+  local existing_value
+  existing_value=$($(kube_cmd) -n "${NS}" get configmap "${CSI_KMS_CONFIGMAP}" -o jsonpath="{.data.${kms_id}}")
+  $(kube_cmd) -n "${NS}" patch configmap "${CSI_KMS_CONFIGMAP}" \
+    --type=json \
+    -p "[{\"op\": \"add\", \"path\": \"/data/${kms_id}-orig\", \"value\": $(echo -n "${existing_value}" | jq -Rs .)}]"
+
+  # Step 3: Replace the original key with KP config
+  log_info "Setting ConfigMap key '${kms_id}' to KP configuration"
+  local new_kms_compact
+  new_kms_compact=$(echo "${new_kms_entry}" | jq -c .)
+  $(kube_cmd) -n "${NS}" patch configmap "${CSI_KMS_CONFIGMAP}" \
+    --type=json \
+    -p "[{\"op\": \"replace\", \"path\": \"/data/${kms_id}\", \"value\": $(echo -n "${new_kms_compact}" | jq -Rs .)}]"
+
+  log_info "Phase 6 complete. CSI KMS ConfigMap updated and KP secret created."
+}
+
 # --- Main ---
 
 usage() {
   cat <<EOF
 Usage: $0 <command>
-    
+
 A helper script to migrate encrypted RBD volumes from IBM HPCS to IBM Key Protect.
 
 Commands:
@@ -384,6 +499,7 @@ Commands:
   phase2      Decrypt DEKs using HPCS Unwrap
   phase3      Re-encrypt DEKs using IBM Key Protect Wrap
   phase4      Update RBD image metadata with new DEKs (destructive)
+  phase6      Update CSI KMS ConfigMap to use Key Protect (destructive)
 
 Environment variables (auto sourced if a .env file exists):
   LOG_LEVEL           Log level: DEBUG, INFO, WARN, ERROR, FATAL (default: INFO)
@@ -392,12 +508,13 @@ Environment variables (auto sourced if a .env file exists):
   NS                  Namespace (default: openshift-storage)
   STORAGE_CLASS       Kubernetes StorageClass name (default: ocs-storagecluster-ceph-rbd-encrypted)
                       Pool, pool ID, cluster ID, and volume name prefix are derived automatically.
+  CSI_KMS_CONFIGMAP   CSI KMS ConfigMap name (default: csi-kms-connection-details)
 
   HPCS_INSTANCE_ID    HPCS instance ID
   HPCS_IAM_API_KEY    HPCS IAM API key
   HPCS_KEY_ID         HPCS root key ID
   HPCS_URL            HPCS API URL
-  
+
   KP_INSTANCE_ID      Key Protect instance ID
   KP_IAM_API_KEY      Key Protect IAM API key
   KP_KEY_ID           Key Protect root key ID
@@ -416,6 +533,7 @@ main() {
   phase2) phase2_unwrap_hpcs ;;
   phase3) phase3_wrap_kp ;;
   phase4) phase4_update_metadata ;;
+  phase6) phase6_update_kms_config ;;
   *)
     usage
     exit 1
