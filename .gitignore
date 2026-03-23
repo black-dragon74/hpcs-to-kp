@@ -6,6 +6,7 @@ rbd_volumes.json
 
 # OSD
 osd_keys.json
+noobaa_key.json
 exported_keys/
 
 # Sekuritiii
