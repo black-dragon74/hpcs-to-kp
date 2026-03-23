@@ -371,10 +371,10 @@ phase4_update_metadata() {
   log_info "Phase 4 complete. RBD metadata updated."
 }
 
-# --- Phase 6: Update CSI KMS ConfigMap to use KP ---
+# --- Phase 5: Update CSI KMS ConfigMap to use KP ---
 
-phase6_update_kms_config() {
-  log_info "Phase 6: Updating CSI KMS ConfigMap to use Key Protect"
+phase5_update_kms_config() {
+  log_info "Phase 5: Updating CSI KMS ConfigMap to use Key Protect"
 
   # Get encryptionKMSID from StorageClass
   local sc_json
@@ -439,7 +439,7 @@ phase6_update_kms_config() {
 
   # Show summary
   echo ""
-  log_warn "=== Phase 6 Summary ==="
+  log_warn "=== Phase 5 Summary ==="
   echo ""
   echo "ConfigMap: ${CSI_KMS_CONFIGMAP} (namespace: ${NS})"
   echo ""
@@ -455,7 +455,7 @@ phase6_update_kms_config() {
 
   read -rp "Proceed? (yes/no): " confirm
   if [[ "${confirm}" != "yes" ]]; then
-    log_info "Phase 6 aborted by user."
+    log_info "Phase 5 aborted by user."
     return 1
   fi
 
@@ -482,7 +482,8 @@ phase6_update_kms_config() {
     --type=json \
     -p "[{\"op\": \"replace\", \"path\": \"/data/${kms_id}\", \"value\": $(echo -n "${new_kms_compact}" | jq -Rs .)}]"
 
-  log_info "Phase 6 complete. CSI KMS ConfigMap updated and KP secret created."
+  log_info "Phase 5 complete. CSI KMS ConfigMap updated and KP secret created."
+  log_info "The PVC mounts should now complete without any errors."
 }
 
 # --- Main ---
@@ -499,7 +500,7 @@ Commands:
   phase2      Decrypt DEKs using HPCS Unwrap
   phase3      Re-encrypt DEKs using IBM Key Protect Wrap
   phase4      Update RBD image metadata with new DEKs (destructive)
-  phase6      Update CSI KMS ConfigMap to use Key Protect (destructive)
+  phase5      Update CSI KMS ConfigMap to use Key Protect (destructive)
 
 Environment variables (auto sourced if a .env file exists):
   LOG_LEVEL           Log level: DEBUG, INFO, WARN, ERROR, FATAL (default: INFO)
@@ -526,14 +527,11 @@ main() {
   local cmd="${1:-}"
   case "${cmd}" in
   check) check_prereqs ;;
-  phase1)
-    check_prereqs
-    phase1_discover
-    ;;
+  phase1) phase1_discover ;;
   phase2) phase2_unwrap_hpcs ;;
   phase3) phase3_wrap_kp ;;
   phase4) phase4_update_metadata ;;
-  phase6) phase6_update_kms_config ;;
+  phase5) phase5_update_kms_config ;;
   *)
     usage
     exit 1
