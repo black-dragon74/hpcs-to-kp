@@ -11,6 +11,7 @@ STORAGE_CLASS=${STORAGE_CLASS:-ocs-storagecluster-ceph-rbd-encrypted}
 CSI_KMS_CONFIGMAP=${CSI_KMS_CONFIGMAP:-csi-kms-connection-details}
 SUBVOLUME_GROUP=${SUBVOLUME_GROUP:-csi}
 DATA_FILE=${DATA_FILE:-rbd_volumes.json}
+SCALE_STATE_FILE=${SCALE_STATE_FILE:-csi_scale_state.json}
 TOOLBOX_LABEL="app=rook-ceph-tools"
 
 # Derived from StorageClass and Ceph (set by resolve_params)
@@ -486,6 +487,145 @@ phase5_update_kms_config() {
   log_info "The PVC mounts should now complete without any errors."
 }
 
+# --- Pre/Post: Scale CSI provisioners ---
+
+detect_csi_mode() {
+  local operator_deps
+  operator_deps=$($(kube_cmd) -n "${NS}" get deployment -l app.kubernetes.io/name=ceph-csi-operator -o name 2>/dev/null || true)
+
+  if [[ -n "${operator_deps}" ]]; then
+    echo "operator"
+    return
+  fi
+
+  local rook_deps
+  rook_deps=$($(kube_cmd) -n "${NS}" get deployment -o name 2>/dev/null | grep 'csi-rbdplugin-provisioner' || true)
+
+  if [[ -n "${rook_deps}" ]]; then
+    echo "rook"
+    return
+  fi
+
+  echo ""
+}
+
+save_and_scale_deployment() {
+  local deploy="$1"
+  local name
+  name=$(basename "${deploy}")
+
+  local replicas
+  replicas=$($(kube_cmd) -n "${NS}" get "${deploy}" -o jsonpath='{.spec.replicas}' 2>/dev/null)
+
+  jq --arg name "${name}" --argjson replicas "${replicas:-0}" \
+    '.deployments[$name] = $replicas' \
+    "${SCALE_STATE_FILE}" >"${SCALE_STATE_FILE}.tmp" && mv "${SCALE_STATE_FILE}.tmp" "${SCALE_STATE_FILE}"
+
+  log_info "Scaling ${name} from ${replicas} to 0"
+  $(kube_cmd) -n "${NS}" scale "${deploy}" --replicas=0
+}
+
+pre_scale_down() {
+  log_info "Pre: Scaling down CSI provisioner deployments"
+
+  local mode
+  mode=$(detect_csi_mode)
+
+  if [[ -z "${mode}" ]]; then
+    log_fatal "Could not detect CSI mode (no ceph-csi-operator or rook csi-rbdplugin-provisioner deployments found in ${NS})"
+  fi
+
+  log_info "Detected CSI mode: ${mode}"
+
+  jq -n --arg mode "${mode}" '{mode: $mode, deployments: {}}' >"${SCALE_STATE_FILE}"
+
+  if [[ "${mode}" == "operator" ]]; then
+    # Scale down the operator first
+    local operator_deps
+    operator_deps=$($(kube_cmd) -n "${NS}" get deployment -l app.kubernetes.io/name=ceph-csi-operator -o name 2>/dev/null)
+
+    while IFS= read -r deploy; do
+      [[ -z "${deploy}" ]] && continue
+      save_and_scale_deployment "${deploy}"
+    done <<<"${operator_deps}"
+
+    # Wait for operator to scale down before scaling controller plugins
+    log_info "Waiting for operator to scale down..."
+    sleep 5
+
+    # Scale down all ctrlplugin deployments
+    local ctrl_deps
+    ctrl_deps=$($(kube_cmd) -n "${NS}" get deployment -o name 2>/dev/null | grep 'csi\.ceph\.com-ctrlplugin$' || true)
+
+    while IFS= read -r deploy; do
+      [[ -z "${deploy}" ]] && continue
+      save_and_scale_deployment "${deploy}"
+    done <<<"${ctrl_deps}"
+
+  elif [[ "${mode}" == "rook" ]]; then
+    local rook_deps
+    rook_deps=$($(kube_cmd) -n "${NS}" get deployment -o name 2>/dev/null | grep 'csi-rbdplugin-provisioner' || true)
+
+    while IFS= read -r deploy; do
+      [[ -z "${deploy}" ]] && continue
+      save_and_scale_deployment "${deploy}"
+    done <<<"${rook_deps}"
+  fi
+
+  log_info "Pre complete. Scale state saved to ${SCALE_STATE_FILE}"
+}
+
+post_scale_up() {
+  log_info "Post: Restoring CSI provisioner deployments"
+
+  if [[ ! -f "${SCALE_STATE_FILE}" ]]; then
+    log_fatal "Scale state file ${SCALE_STATE_FILE} not found. Run 'pre' first."
+  fi
+
+  local mode
+  mode=$(jq -r '.mode' "${SCALE_STATE_FILE}")
+
+  local names
+  names=$(jq -r '.deployments | keys[]' "${SCALE_STATE_FILE}")
+
+  # For operator mode, restore ctrlplugins first, then operator
+  # (reverse order of scale-down)
+  if [[ "${mode}" == "operator" ]]; then
+    # Restore ctrlplugin deployments first
+    while IFS= read -r name; do
+      [[ -z "${name}" ]] && continue
+      echo "${name}" | grep -q 'csi\.ceph\.com-ctrlplugin$' || continue
+
+      local replicas
+      replicas=$(jq -r --arg name "${name}" '.deployments[$name]' "${SCALE_STATE_FILE}")
+      log_info "Restoring deployment/${name} to ${replicas} replicas"
+      $(kube_cmd) -n "${NS}" scale "deployment/${name}" --replicas="${replicas}"
+    done <<<"${names}"
+
+    # Then restore operator
+    while IFS= read -r name; do
+      [[ -z "${name}" ]] && continue
+      echo "${name}" | grep -q 'csi\.ceph\.com-ctrlplugin$' && continue
+
+      local replicas
+      replicas=$(jq -r --arg name "${name}" '.deployments[$name]' "${SCALE_STATE_FILE}")
+      log_info "Restoring deployment/${name} to ${replicas} replicas"
+      $(kube_cmd) -n "${NS}" scale "deployment/${name}" --replicas="${replicas}"
+    done <<<"${names}"
+  else
+    while IFS= read -r name; do
+      [[ -z "${name}" ]] && continue
+
+      local replicas
+      replicas=$(jq -r --arg name "${name}" '.deployments[$name]' "${SCALE_STATE_FILE}")
+      log_info "Restoring deployment/${name} to ${replicas} replicas"
+      $(kube_cmd) -n "${NS}" scale "deployment/${name}" --replicas="${replicas}"
+    done <<<"${names}"
+  fi
+
+  log_info "Post complete. All deployments restored."
+}
+
 # --- Main ---
 
 usage() {
@@ -496,15 +636,18 @@ A helper script to migrate encrypted RBD volumes from IBM HPCS to IBM Key Protec
 
 Commands:
   check       Check prerequisites
+  pre         Scale down CSI provisioner deployments (run before migration)
   phase1      Discover encrypted RBD volumes and collect DEKs
   phase2      Decrypt DEKs using HPCS Unwrap
   phase3      Re-encrypt DEKs using IBM Key Protect Wrap
   phase4      Update RBD image metadata with new DEKs (destructive)
   phase5      Update CSI KMS ConfigMap to use Key Protect (destructive)
+  post        Restore CSI provisioner deployments (run after migration)
 
 Environment variables (auto sourced if a .env file exists):
   LOG_LEVEL           Log level: DEBUG, INFO, WARN, ERROR, FATAL (default: INFO)
   DATA_FILE           JSON output file (default: rbd_volumes.json)
+  SCALE_STATE_FILE    Scale state file for pre/post (default: csi_scale_state.json)
 
   NS                  Namespace (default: openshift-storage)
   STORAGE_CLASS       Kubernetes StorageClass name (default: ocs-storagecluster-ceph-rbd-encrypted)
@@ -527,11 +670,13 @@ main() {
   local cmd="${1:-}"
   case "${cmd}" in
   check) check_prereqs ;;
+  pre) pre_scale_down ;;
   phase1) phase1_discover ;;
   phase2) phase2_unwrap_hpcs ;;
   phase3) phase3_wrap_kp ;;
   phase4) phase4_update_metadata ;;
   phase5) phase5_update_kms_config ;;
+  post) post_scale_up ;;
   *)
     usage
     exit 1
