@@ -105,6 +105,8 @@ check_common_prereqs() {
   pod=$(get_toolbox_pod)
   if [[ -z "$pod" ]]; then
     log_error "No pod with label ${TOOLBOX_LABEL:-app=rook-ceph-tools} in namespace ${NS}"
+    log_info "Enable the Ceph toolbox by setting storagecluster.spec.enableCephTools: true"
+    log_info "  $(kube_cmd) -n ${NS} patch storagecluster <NAME> --type merge -p '{\"spec\":{\"enableCephTools\":true}}'"
     missing=1
   else
     log_info "Found toolbox pod: ${pod}"
