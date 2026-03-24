@@ -587,11 +587,17 @@ phase5_switch() {
   fi
   log_info "Token secret updated and verified (API key + customer root key)."
 
-  # Step 2: Restart noobaa-operator to pick up new KMS config
+  # Step 2: Restart noobaa-operator to re-reconcile KMS config
   log_info "Restarting noobaa-operator..."
   $(kube_cmd) -n "${NS}" rollout restart deploy/noobaa-operator
   $(kube_cmd) -n "${NS}" rollout status deploy/noobaa-operator --timeout=120s
   log_info "noobaa-operator restarted."
+
+  # Step 3: Restart noobaa core statefulset to pick up new secret values
+  log_info "Restarting noobaa core statefulset..."
+  $(kube_cmd) -n "${NS}" rollout restart statefulset -l app=noobaa
+  $(kube_cmd) -n "${NS}" rollout status statefulset -l app=noobaa --timeout=120s
+  log_info "noobaa core restarted."
 
   log_info "Phase 5 complete. The noobaa-operator will re-reconcile the KMS connection."
   log_info "Run phase 6 to verify recovery."
@@ -722,6 +728,12 @@ rollback() {
   $(kube_cmd) -n "${NS}" rollout restart deploy/noobaa-operator
   $(kube_cmd) -n "${NS}" rollout status deploy/noobaa-operator --timeout=120s
   log_info "noobaa-operator restarted."
+
+  # Restart noobaa core statefulset
+  log_info "Restarting noobaa core statefulset..."
+  $(kube_cmd) -n "${NS}" rollout restart statefulset -l app=noobaa
+  $(kube_cmd) -n "${NS}" rollout status statefulset -l app=noobaa --timeout=120s
+  log_info "noobaa core restarted."
 
   log_info "Rollback complete."
 }
