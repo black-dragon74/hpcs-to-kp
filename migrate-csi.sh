@@ -564,7 +564,7 @@ pre_scale_down() {
 
   elif [[ "${mode}" == "rook" ]]; then
     local rook_deps
-    rook_deps=$($(kube_cmd) -n "${NS}" get deployment -o name 2>/dev/null | grep 'csi-rbdplugin-provisioner' || true)
+    rook_deps=$($(kube_cmd) -n "${NS}" get deployment -o name 2>/dev/null | grep -E 'csi-(rbdplugin|cephfsplugin|nfsplugin)-provisioner' || true)
 
     while IFS= read -r deploy; do
       [[ -z "${deploy}" ]] && continue
