@@ -30,9 +30,9 @@ Logging, Kubernetes helpers, IAM token management, `.env` loading. Sourced by al
 
 ## Recommended migration order
 
-1. **OSD keys** — `migrate-osd.sh` phases 1–6 (switches the shared KMS ConfigMap)
-2. **NooBaa key** — `migrate-noobaa.sh` phases 1–6 (depends on the KMS ConfigMap already pointing to KP)
-3. **CSI volumes** — `migrate-csi.sh` pre → phases 1–5 → post (independent KMS ConfigMap entry)
+1. **CSI volumes** — `migrate-csi.sh` pre → phases 1–5 → post (independent KMS ConfigMap entry)
+2. **OSD keys** — `migrate-osd.sh` phases 1–6 (switches the shared KMS ConfigMap)
+3. **NooBaa key** — `migrate-noobaa.sh` phases 1–6 (depends on the KMS ConfigMap already pointing to KP)
 
 Each script supports `rollback` and `cleanup` commands.
 
