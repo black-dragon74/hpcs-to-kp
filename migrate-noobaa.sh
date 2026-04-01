@@ -398,7 +398,8 @@ phase3_import() {
           type: "application/vnd.ibm.kms.key+json",
           name: $name,
           extractable: true,
-          payload: $payload
+          payload: $payload,
+          aliases: [$name]
         }]
       }')")
 
