@@ -525,6 +525,19 @@ save_and_scale_deployment() {
   $(kube_cmd) -n "${NS}" scale "${deploy}" --replicas=0
 }
 
+save_and_scale_daemonset() {
+  local ds="$1"
+  local name
+  name=$(basename "${ds}")
+
+  jq --arg name "${name}" '.daemonsets[$name] = true' \
+    "${SCALE_STATE_FILE}" >"${SCALE_STATE_FILE}.tmp" && mv "${SCALE_STATE_FILE}.tmp" "${SCALE_STATE_FILE}"
+
+  log_info "Scaling down daemonset ${name}"
+  $(kube_cmd) -n "${NS}" patch "${ds}" --type=merge \
+    -p '{"spec":{"template":{"spec":{"nodeSelector":{"non-existing-node":"true"}}}}}'
+}
+
 pre_scale_down() {
   log_info "Pre: Scaling down CSI provisioner deployments"
 
@@ -537,7 +550,7 @@ pre_scale_down() {
 
   log_info "Detected CSI mode: ${mode}"
 
-  jq -n --arg mode "${mode}" '{mode: $mode, deployments: {}}' >"${SCALE_STATE_FILE}"
+  jq -n --arg mode "${mode}" '{mode: $mode, deployments: {}, daemonsets: {}}' >"${SCALE_STATE_FILE}"
 
   if [[ "${mode}" == "operator" ]]; then
     # Scale down the operator first
@@ -555,12 +568,21 @@ pre_scale_down() {
 
     # Scale down all ctrlplugin deployments
     local ctrl_deps
-    ctrl_deps=$($(kube_cmd) -n "${NS}" get deployment -o name 2>/dev/null | grep 'csi\.ceph\.com-ctrlplugin$' || true)
+    ctrl_deps=$($(kube_cmd) -n "${NS}" get deployment -o name 2>/dev/null | grep 'csi.ceph.com-ctrlplugin' || true)
 
     while IFS= read -r deploy; do
       [[ -z "${deploy}" ]] && continue
       save_and_scale_deployment "${deploy}"
     done <<<"${ctrl_deps}"
+
+    # Scale down nodeplugin daemonsets
+    local operator_ds
+    operator_ds=$($(kube_cmd) -n "${NS}" get daemonset -o name 2>/dev/null | grep 'csi.ceph.com-nodeplugin' || true)
+
+    while IFS= read -r ds; do
+      [[ -z "${ds}" ]] && continue
+      save_and_scale_daemonset "${ds}"
+    done <<<"${operator_ds}"
 
   elif [[ "${mode}" == "rook" ]]; then
     local rook_deps
@@ -570,6 +592,15 @@ pre_scale_down() {
       [[ -z "${deploy}" ]] && continue
       save_and_scale_deployment "${deploy}"
     done <<<"${rook_deps}"
+
+    # Scale down nodeplugin daemonsets
+    local rook_ds
+    rook_ds=$($(kube_cmd) -n "${NS}" get daemonset -o name 2>/dev/null | grep -E 'csi-(cephfsplugin|rbdplugin|nfsplugin)' || true)
+
+    while IFS= read -r ds; do
+      [[ -z "${ds}" ]] && continue
+      save_and_scale_daemonset "${ds}"
+    done <<<"${rook_ds}"
   fi
 
   log_info "Pre complete. Scale state saved to ${SCALE_STATE_FILE}"
@@ -623,7 +654,18 @@ post_scale_up() {
     done <<<"${names}"
   fi
 
-  log_info "Post complete. All deployments restored."
+  # Restore daemonsets
+  local ds_names
+  ds_names=$(jq -r '.daemonsets // {} | keys[]' "${SCALE_STATE_FILE}")
+
+  while IFS= read -r name; do
+    [[ -z "${name}" ]] && continue
+    log_info "Restoring daemonset/${name} (removing non-existing nodeSelector)"
+    $(kube_cmd) -n "${NS}" patch "daemonset/${name}" --type=json \
+      -p '[{"op": "remove", "path": "/spec/template/spec/nodeSelector/non-existing-node"}]'
+  done <<<"${ds_names}"
+
+  log_info "Post complete. All deployments and daemonsets restored."
 }
 
 # --- Main ---
