@@ -10,4 +10,5 @@ noobaa_key.json
 exported_keys/
 
 # Sekuritiii
-.env
+.env*
+!.env.example
