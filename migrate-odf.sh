@@ -171,6 +171,12 @@ migrate() {
   log_info "  3. NooBaa key   — migrate-noobaa.sh (phases 1-6)"
   echo ""
 
+  # Run prerequisite checks for all scripts before starting
+  log_info "Running prerequisite checks..."
+  run_phase migrate-csi.sh check
+  run_phase migrate-osd.sh check
+  run_phase migrate-noobaa.sh check
+
   read -rp "Start migration? (yes/no): " confirm
   if [[ "${confirm}" != "yes" ]]; then
     log_info "Migration aborted by user."
