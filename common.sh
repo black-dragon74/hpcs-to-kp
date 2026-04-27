@@ -104,10 +104,28 @@ check_common_prereqs() {
   local pod
   pod=$(get_toolbox_pod)
   if [[ -z "$pod" ]]; then
-    log_error "No pod with label ${TOOLBOX_LABEL:-app=rook-ceph-tools} in namespace ${NS}"
-    log_info "Enable the Ceph toolbox by setting storagecluster.spec.enableCephTools: true"
-    log_info "  $(kube_cmd) -n ${NS} patch storagecluster <NAME> --type merge -p '{\"spec\":{\"enableCephTools\":true}}'"
-    missing=1
+    log_warn "No pod with label ${TOOLBOX_LABEL:-app=rook-ceph-tools} in namespace ${NS}"
+    read -rp "Enable the Ceph toolbox automatically? (yes/no): " enable_toolbox
+    if [[ "${enable_toolbox}" == "yes" ]]; then
+      local sc_name
+      sc_name=$($(kube_cmd) -n "${NS}" get storagecluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || true
+      if [[ -z "${sc_name}" ]]; then
+        log_error "Could not detect StorageCluster name in namespace ${NS}"
+        missing=1
+      else
+        log_info "Patching StorageCluster '${sc_name}' to enable Ceph toolbox..."
+        $(kube_cmd) -n "${NS}" patch storagecluster "${sc_name}" --type merge \
+          -p '{"spec":{"enableCephTools":true}}'
+        log_info "Waiting for toolbox pod to become ready..."
+        $(kube_cmd) -n "${NS}" wait pod -l "${TOOLBOX_LABEL:-app=rook-ceph-tools}" \
+          --for=condition=Ready --timeout=120s
+        pod=$(get_toolbox_pod)
+        log_info "Found toolbox pod: ${pod}"
+      fi
+    else
+      log_error "Ceph toolbox is required. Enable it manually and re-run."
+      missing=1
+    fi
   else
     log_info "Found toolbox pod: ${pod}"
   fi
