@@ -238,34 +238,6 @@ migrate() {
   log_info "  ${SCRIPT_DIR}/migrate-noobaa.sh cleanup"
 }
 
-# --- Rollback ---
-
-rollback() {
-  log_warn "Rolling back full ODF KMS migration"
-  echo ""
-  log_warn "This will revert all three subsystems to HPCS in reverse order."
-
-  read -rp "Proceed with full rollback? (yes/no): " confirm
-  if [[ "${confirm}" != "yes" ]]; then
-    log_info "Rollback aborted by user."
-    exit 0
-  fi
-
-  log_info "Rolling back NooBaa..."
-  run_phase migrate-noobaa.sh rollback
-
-  log_info "Rolling back OSD..."
-  run_phase migrate-osd.sh rollback
-
-  # CSI rollback is manual (restore original KMS ConfigMap entry, re-wrap DEKs with HPCS key)
-  log_warn "CSI rollback requires manual steps:"
-  log_warn "  1. Restore the original csi-kms-connection-details entry"
-  log_warn "  2. Re-wrap DEKs with the HPCS root key"
-  log_warn "  See migrate-csi.sh for details."
-
-  log_info "Rollback complete (except CSI — see above)."
-}
-
 # --- Main ---
 
 usage() {
@@ -278,7 +250,6 @@ scripts in the correct order.
 
 Commands:
   migrate     Run the full migration (CSI -> OSD -> NooBaa)
-  rollback    Rollback in reverse order (NooBaa -> OSD; CSI is manual)
   detect      Auto-detect HPCS config and write to .env (without migrating)
 
 Migration order:
@@ -296,7 +267,6 @@ main() {
   local cmd="${1:-}"
   case "${cmd}" in
   migrate) migrate ;;
-  rollback) rollback ;;
   detect) detect_hpcs_config ;;
   *)
     usage
